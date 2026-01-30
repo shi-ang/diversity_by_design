@@ -243,6 +243,50 @@ def plot_pearson_delta_affected_vs_perturbations(data, save_path, window=50):
     
     print(f"Generated {save_path}")
 
+def plot_mse_vs_p_effect(data, save_path, window=50):
+    """Plot MSE vs p_effect (fraction of genes affected).
+    
+    Args:
+        data: DataFrame containing simulation results
+        save_path: Path to save the plot
+        window: Window size for moving average calculation (default: 50)
+    """
+    fig, ax = plt.subplots(figsize=(7, 6))
+    
+    x = data['p_effect']
+    y = data['mse_all_median']
+    
+    # Create scatter plot with default seaborn blue dots
+    ax.scatter(x, y, alpha=0.3, s=20)
+    
+    # Calculate Pearson correlation
+    corr, p_value = stats.pearsonr(x, y)
+    
+    # Add moving average trend line with specified window
+    x_ma, y_ma = moving_average(np.array(x), np.array(y), window=window)
+    ax.plot(x_ma, y_ma, color='navy', linestyle='--', linewidth=2)
+    
+    # Add title - bold and include "simulation"
+    ax.set_title(r'$\mathbf{MSE}$ $\mathbf{(Simulation)}$', fontsize=18.5, pad=20)
+    
+    # Set axis labels
+    ax.set_xlabel(r'Perturbation Probability ($\delta$)', fontsize=16)
+    ax.set_ylabel('MSE', fontsize=16)
+    
+    # Add correlation text
+    ax.text(0.05, 0.97, f'Pearson R={corr:.2f}, P={p_value:.2e}', 
+            transform=ax.transAxes, fontsize=15, va='bottom', ha='left')
+    
+    # Remove top and right spines
+    sns.despine()
+    
+    # Save figure as PDF
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    
+    print(f"Generated {save_path}")
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Generate Pearson delta plots from simulation results.')
@@ -267,11 +311,13 @@ def main():
         control_bias_path = os.path.join(plot_dir, 'pearson_delta_vs_control_bias.pdf')
         n0_path = os.path.join(plot_dir, 'pearson_delta_vs_n0.pdf')
         perturbations_path = os.path.join(plot_dir, 'pearson_delta_affected_vs_perturbations.pdf')
+        mse_p_effect_path = os.path.join(plot_dir, 'mse_vs_p_effect.pdf')
         
-        # Generate all three plots
+        # Generate all plots
         plot_pearson_delta_vs_control_bias(data, control_bias_path, window)
         plot_pearson_delta_vs_n0(data, n0_path, window)
         plot_pearson_delta_affected_vs_perturbations(data, perturbations_path, window)
+        plot_mse_vs_p_effect(data, mse_p_effect_path, window)
         
         print(f"Successfully generated all plots from {args.results}")
     except Exception as e:
