@@ -1,3 +1,4 @@
+import argparse
 import numpy as np
 import pandas as pd
 import os
@@ -13,8 +14,18 @@ from metrics.perturbation_effect.perturbation_discrimination_score import comput
 # Set OpenBLAS threads early if it was found to be helpful, otherwise optional
 # os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
-# Set seed
-np.random.seed(42)
+_GLOBAL = {}
+_PARAM_RANGES = {
+    'G': {'type': 'int', 'min': 1000, 'max': 8192}, # 1000, 8192, g
+    'N0': {'type': 'log_int', 'min': 10, 'max': 8192}, # 10, 8192, n_0
+    'Nk': {'type': 'log_int', 'min': 10, 'max': 256}, # 10, 256, n_p
+    'P': {'type': 'log_int', 'min': 10, 'max': 2000}, # 10, 2000, k
+    'p_effect': {'type': 'float', 'min': 0.001, 'max': 0.1}, # 0.001, 0.1, delta
+    'effect_factor': {'type': 'float', 'min': 1.2, 'max': 5.0}, # 1.2, 5.0, epsilon
+    'B': {'type': 'float', 'min': 0.0, 'max': 2.0}, # 0.0, 2.0, beta
+    'mu_l': {'type': 'log_float', 'min': 0.2, 'max': 5.0} # 0.2, 5.0, mu_l
+}
+
 
 def nb_cells(mean, l_c, theta, rng): # theta kept as generic parameter name for this utility function
     """
@@ -230,8 +241,6 @@ def simulate_one_run_numpy( # Renamed to signify it's the numpy-only version
         metric="cosine",
     )
 
-    del delta_obs
-
     # "_all" is for all genes
     # "_affected" is for the genes that were truly affected in the simulation (like true DEGs)
     # "_degs" is for the genes identified as DEGs by the t-test (statistical DEGs)
@@ -359,13 +368,10 @@ def sample_parameters(param_ranges): # Unchanged from original
             params[param] = range_info['value']
     return params
 
-_GLOBAL = {}
-
 def init_worker(control_mu, all_theta, pert_mu):
     _GLOBAL["control_mu"] = control_mu
     _GLOBAL["all_theta"] = all_theta
     _GLOBAL["pert_mu"] = pert_mu
-
 
 # Revised _pool_worker to include timing (matches spirit of original)
 def _pool_worker_timed(task_info_dict):
@@ -431,35 +437,56 @@ def est_cost(params):
 
 
 # And run_random_sweep needs to use _pool_worker_timed and prepare tasks for it:
-def run_random_sweep_final(n_trials, param_ranges, output_dir, control_mu=None, all_theta=None, pert_mu=None, num_workers=None): # Renamed from run_random_sweep
+def run_random_sweep_final(
+    n_trials,
+    output_dir,
+    control_mu=None,
+    all_theta=None,
+    pert_mu=None,
+    num_workers=None,
+    use_multiprocessing=True,
+): # Renamed from run_random_sweep
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_file = os.path.join(output_dir, f"random_sweep_results_{timestamp}.csv")
     error_log_file = os.path.join(output_dir, f"error_log_{timestamp}.txt")
 
-    if num_workers is None:
-        num_workers = os.cpu_count()
-    print(f"Starting NumPy-based random parameter sweep with {n_trials} trials using {num_workers} worker processes (spawn context).")
+    if use_multiprocessing:
+        if num_workers is None:
+            num_workers = os.cpu_count()
+        print(f"Starting NumPy-based random parameter sweep with {n_trials} trials using {num_workers} worker processes (spawn context).")
+    else:
+        print(f"Starting NumPy-based random parameter sweep with {n_trials} trials using sequential execution.")
 
     tasks_for_pool = []
     for i in range(n_trials):
-        params = sample_parameters(param_ranges)
+        params = sample_parameters(_PARAM_RANGES)
         tasks_for_pool.append({'trial_id': i, 'params_dict': params})
     # sort tasks by estimated cost in descending order to optimize workload distribution
     tasks_for_pool.sort(key=lambda t: est_cost(t["params_dict"]), reverse=True)
 
     all_results_data = []
     
-    ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(
-        processes=num_workers, 
-        initializer=init_worker, 
-        initargs=(control_mu, all_theta, pert_mu),
-        maxtasksperchild=100,
-    ) as pool:
+    if use_multiprocessing:
+        print("Multiprocessing can be memory intensive, so if running into swap, reduce the number of workers.")
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(
+            processes=num_workers, 
+            initializer=init_worker, 
+            initargs=(control_mu, all_theta, pert_mu),
+            maxtasksperchild=100,
+        ) as pool:
+            print("\nProcessing trials (NumPy version with worker timing):")
+            with tqdm(total=n_trials, desc="Running Trials (NumPy)") as pbar:
+                for result_from_worker in pool.imap_unordered(_pool_worker_timed, tasks_for_pool):
+                    all_results_data.append(result_from_worker)
+                    pbar.update(1)
+    else:
+        init_worker(control_mu, all_theta, pert_mu)
         print("\nProcessing trials (NumPy version with worker timing):")
         with tqdm(total=n_trials, desc="Running Trials (NumPy)") as pbar:
-            for result_from_worker in pool.imap_unordered(_pool_worker_timed, tasks_for_pool):
+            for task in tasks_for_pool:
+                result_from_worker = _pool_worker_timed(task)
                 all_results_data.append(result_from_worker)
                 pbar.update(1)
 
@@ -505,7 +532,16 @@ def run_random_sweep_final(n_trials, param_ranges, output_dir, control_mu=None, 
 
 
 if __name__ == "__main__":
-    output_dir = "analyses/synthetic_simulations/random_sweep_results"
+    parser = argparse.ArgumentParser(description="Run random sweep simulations.")
+    parser.add_argument("--output_dir", type=str, default="analyses/synthetic_simulations/random_sweep_results", help="Directory to save sweep results")
+    parser.add_argument("--n_trials", type=int, default=2, help="Number of trials to run")
+    parser.add_argument("--num_workers", type=int, default=32, help="Number of worker processes for multiprocessing")
+    parser.add_argument("--multiprocessing", action="store_true", help="Enable multiprocessing")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    args = parser.parse_args()
+
+    # Set seed
+    np.random.seed(args.seed)
     
     # Load fitted parameters from parameter estimation files
     control_params_df = pd.read_csv("analyses/synthetic_simulations/parameter_estimation/control_fitted_params.csv", index_col=0)
@@ -522,27 +558,18 @@ if __name__ == "__main__":
     main_all_theta_loaded = all_params_df['n'].values
     
     print(f"Using {len(main_control_mu_loaded)} genes for simulation.")
-
-    param_ranges = {
-        'G': {'type': 'int', 'min': 1000, 'max': 8192}, # 1000, 8192, g
-        'N0': {'type': 'log_int', 'min': 10, 'max': 8192}, # 10, 8192, n_0
-        'Nk': {'type': 'log_int', 'min': 10, 'max': 256}, # 10, 256, n_p
-        'P': {'type': 'log_int', 'min': 10, 'max': 2000}, # 10, 2000, k
-        'p_effect': {'type': 'float', 'min': 0.001, 'max': 0.1}, # 0.001, 0.1, delta
-        'effect_factor': {'type': 'float', 'min': 1.2, 'max': 5.0}, # 1.2, 5.0, epsilon
-        'B': {'type': 'float', 'min': 0.0, 'max': 2.0}, # 0.0, 2.0, beta
-        'mu_l': {'type': 'log_float', 'min': 0.2, 'max': 5.0} # 0.2, 5.0, mu_l
-    }
     
-    n_trials = 2
     # Call the final version of run_random_sweep
     print("Running the sweep...")
-    print("Multiprocessing can be memory intensive, so if running into swap, reduce the number of workers.")
-    csv_file = run_random_sweep_final(n_trials, param_ranges, output_dir, 
-                                      control_mu=main_control_mu_loaded, 
-                                      all_theta=main_all_theta_loaded,
-                                      pert_mu=main_pert_mu_loaded,
-                                      num_workers=32) # num_worker should be around 0.6 * RAM / MAX_SPACE_PER_WORK
+    csv_file = run_random_sweep_final(
+        args.n_trials, 
+        args.output_dir, 
+        control_mu=main_control_mu_loaded, 
+        all_theta=main_all_theta_loaded,
+        pert_mu=main_pert_mu_loaded,
+        num_workers=args.num_workers, # num_worker should be around 0.6 * RAM / MAX_SPACE_PER_WORK
+        use_multiprocessing=args.multiprocessing
+    ) 
     print("\nDone doing the sweep. Plotting results...")
 
     # Run uv run python simulations/simulation_plots.py
