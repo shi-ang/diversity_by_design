@@ -89,6 +89,26 @@ def moving_average(x, y, window=10):
     
     return np.array(x_ma), np.array(y_ma)
 
+PDS_LABELS = {
+    'pds_l1': 'PDS (L1)',
+    'pds_l2': 'PDS (L2)',
+    'pds_cosine': 'PDS (Cosine)',
+}
+
+def resolve_pds_metric(data):
+    """Resolve which PDS metric column to use, preferring cosine then l2 then l1."""
+    for candidate in ('pds_cosine', 'pds_l2', 'pds_l1'):
+        if candidate in data.columns:
+            return candidate
+    raise ValueError("No PDS metric columns found in results (expected pds_cosine, pds_l2, or pds_l1).")
+
+def prepare_xy(x, y):
+    """Convert x/y to numeric arrays and drop non-finite values."""
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    return x_arr[mask], y_arr[mask]
+
 def plot_pearson_delta_vs_control_bias(data, save_path, window=50):
     """Plot Pearson delta vs control bias (β).
     
@@ -137,6 +157,105 @@ def plot_pearson_delta_vs_control_bias(data, save_path, window=50):
     plt.close()
     
     print(f"Generated {save_path}")
+
+def plot_pds_vs_parameter(data, save_path, x_column, title, x_label,
+                          window=50, pds_metric=None, log_x=False, log_x_if_range=False):
+    """Plot PDS vs a parameter with a moving average trend line."""
+    fig, ax = plt.subplots(figsize=(7, 6))
+
+    if pds_metric is None:
+        pds_metric = resolve_pds_metric(data)
+    y_series = pd.to_numeric(data[pds_metric], errors='coerce')
+    x_series = data[x_column]
+    x, y = prepare_xy(x_series, y_series)
+
+    # Create scatter plot with default seaborn blue dots
+    ax.scatter(x, y, alpha=0.3, s=20)
+
+    # Decide whether to use log scale on x-axis
+    use_log = log_x
+    if log_x_if_range and len(x) > 0:
+        min_x = np.min(x)
+        max_x = np.max(x)
+        if min_x > 0 and (max_x / min_x) > 10:
+            use_log = True
+
+    # Calculate Pearson correlation
+    corr_x = np.log10(x) if use_log else x
+    corr, p_value = stats.pearsonr(corr_x, y)
+
+    # Add moving average trend line with specified window
+    x_ma, y_ma = moving_average(np.array(x), np.array(y), window=window)
+    if len(x_ma) > 0:
+        ax.plot(x_ma, y_ma, color='navy', linestyle='--', linewidth=2)
+
+    # Add title
+    ax.set_title(title, fontsize=18.5, pad=20)
+
+    # Set axis labels
+    ax.set_xlabel(x_label, fontsize=16)
+    pds_label = PDS_LABELS.get(pds_metric, pds_metric)
+    ax.set_ylabel(f'Median {pds_label}', fontsize=16)
+
+    # Set y-axis limits from 0 to 1.1 to make room for annotation
+    ax.set_ylim(0.0, 1.1)
+
+    # Add correlation text at leftmost limit with lowered y position
+    ax.text(0.05, 0.97, f'Pearson R={corr:.2f}, P={p_value:.2e}',
+            transform=ax.transAxes, fontsize=15, va='bottom', ha='left')
+
+    # Use log scale for x-axis if requested
+    if use_log:
+        ax.set_xscale('log')
+
+    # Remove top and right spines
+    sns.despine()
+
+    # Save figure as PDF
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+    print(f"Generated {save_path}")
+
+def plot_pds_vs_control_bias(data, save_path, window=50, pds_metric=None):
+    """Plot PDS vs control bias (β)."""
+    plot_pds_vs_parameter(
+        data=data,
+        save_path=save_path,
+        x_column='B',
+        title=r'$\mathbf{PDS}$ $\mathbf{by}$ $\mathbf{β}$  $\mathbf{(Simulation)}$',
+        x_label='Control Bias (β)',
+        window=window,
+        pds_metric=pds_metric,
+        log_x=False,
+    )
+
+def plot_pds_vs_n0(data, save_path, window=50, pds_metric=None):
+    """Plot PDS vs N0 (number of control cells)."""
+    plot_pds_vs_parameter(
+        data=data,
+        save_path=save_path,
+        x_column='N0',
+        title=r'$\mathbf{PDS}$ $\mathbf{by}$ $\mathbf{n_0}$ $\mathbf{(Simulation)}$',
+        x_label='Number of Control Cells ($n_0$)',
+        window=window,
+        pds_metric=pds_metric,
+        log_x=True,
+    )
+
+def plot_pds_vs_perturbations(data, save_path, window=50, pds_metric=None):
+    """Plot PDS vs number of perturbations."""
+    plot_pds_vs_parameter(
+        data=data,
+        save_path=save_path,
+        x_column='P',
+        title=r'$\mathbf{PDS}$ $\mathbf{by}$ $\mathbf{k}$ $\mathbf{(Simulation)}$',
+        x_label='Number of Perturbations ($k$)',
+        window=window,
+        pds_metric=pds_metric,
+        log_x_if_range=True,
+    )
 
 def plot_pearson_delta_vs_n0(data, save_path, window=50):
     """Plot Pearson delta vs N0 (number of control cells).
@@ -243,9 +362,30 @@ def plot_pearson_delta_affected_vs_perturbations(data, save_path, window=50):
     
     print(f"Generated {save_path}")
 
+def plot_sparsity(data, save_path):
+    """
+    Plot the histogram of sparsity (between 0.0 - 1.0)
+    
+    :param data: Description
+    :param save_path: Description
+    """
+    fig, ax = plt.subplots(figsize=(7, 6))
+
+    sparsity = data["sparsity"]
+    ax.hist(sparsity, bins=30, color='skyblue', edgecolor='black')
+    ax.set_xlabel('Sparsity')
+    ax.set_ylabel('Frequency')
+    ax.set_title('Histogram of Sparsity')
+    
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    
+    print(f"Generated {save_path}")
+
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Generate Pearson delta plots from simulation results.')
+    parser = argparse.ArgumentParser(description='Generate Pearson delta and PDS plots from simulation results.')
     parser.add_argument('--results', type=str, required=True,
                         help='Path to the CSV file with simulation results')
     return parser.parse_args()
@@ -267,11 +407,20 @@ def main():
         control_bias_path = os.path.join(plot_dir, 'pearson_delta_vs_control_bias.pdf')
         n0_path = os.path.join(plot_dir, 'pearson_delta_vs_n0.pdf')
         perturbations_path = os.path.join(plot_dir, 'pearson_delta_affected_vs_perturbations.pdf')
+        pds_metric = resolve_pds_metric(data)
+        pds_control_bias_path = os.path.join(plot_dir, f'{pds_metric}_vs_control_bias.pdf')
+        pds_n0_path = os.path.join(plot_dir, f'{pds_metric}_vs_n0.pdf')
+        pds_perturbations_path = os.path.join(plot_dir, f'{pds_metric}_vs_perturbations.pdf')
+        sparsity_path = os.path.join(plot_dir, 'sparsity.pdf')
         
         # Generate all three plots
         plot_pearson_delta_vs_control_bias(data, control_bias_path, window)
         plot_pearson_delta_vs_n0(data, n0_path, window)
         plot_pearson_delta_affected_vs_perturbations(data, perturbations_path, window)
+        plot_pds_vs_control_bias(data, pds_control_bias_path, window, pds_metric)
+        plot_pds_vs_n0(data, pds_n0_path, window, pds_metric)
+        plot_pds_vs_perturbations(data, pds_perturbations_path, window, pds_metric)
+        plot_sparsity(data, sparsity_path)
         
         print(f"Successfully generated all plots from {args.results}")
     except Exception as e:
@@ -279,4 +428,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

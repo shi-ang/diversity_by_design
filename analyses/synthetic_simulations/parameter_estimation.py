@@ -86,16 +86,16 @@ def fit_negative_binomial(counts):
         nb_results = nb_model.fit(start_params=start_params, disp=False)
         
         # Extract parameters
-        log_mu_fit = nb_results.params[0]
+        log_mu_fit = nb_results.params[0]   # mean
         mu_fit = np.exp(log_mu_fit)
-        alpha_fit = nb_results.params[1]
+        alpha_fit = nb_results.params[1]    # alpha (dispersion), used for variance
         
         # Ensure alpha is positive for calculation
         alpha_fit_calc = max(alpha_fit, 1e-6)
         
         # Calculate parameters for scipy.stats.nbinom
-        n_scipy = 1 / alpha_fit_calc
-        p_scipy = 1 / (1 + alpha_fit_calc * mu_fit)
+        n_scipy = 1 / alpha_fit_calc    # number of successes
+        p_scipy = 1 / (1 + alpha_fit_calc * mu_fit) # probability of success
         
         # Prepare return values
         params = {

@@ -135,7 +135,7 @@ sc.pp.log1p(adata)
 # Downsample each perturbation to have no more than N cells
 MAX_CELLS = 256
 MAX_CELLS_CONTROL = 8192
-
+mode
 pert_counts = adata.obs['condition'].value_counts()
 pert_counts = pert_counts[pert_counts > MAX_CELLS]
 cells_to_keep = []
