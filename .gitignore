@@ -17,4 +17,5 @@ data/save
 .vscode/
 
 logs/*
-run.sh
+*.sh
+results/*

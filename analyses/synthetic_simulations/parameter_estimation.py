@@ -240,7 +240,7 @@ def fit_all_negative_binomials(adata, layer='counts', plot_path=None):
     
     return params_df
 
-results_path = 'parameter_estimation' if local_run else 'analyses/synthetic_simulations/parameter_estimation'
+results_path = 'parameter_estimation' if local_run else 'results/synthetic_simulations/parameter_estimation'
 
 # Fit negative binomials for all genes in control data
 print("\nFitting negative binomials for control cells...")

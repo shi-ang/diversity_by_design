@@ -597,7 +597,7 @@ def run_random_sweep_final(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run random sweep simulations.")
-    parser.add_argument("--output_dir", type=str, default="analyses/synthetic_simulations/random_sweep_results", help="Directory to save sweep results")
+    parser.add_argument("--output_dir", type=str, default="results/synthetic_simulations/random_sweep_results", help="Directory to save sweep results")
     parser.add_argument("--n_trials", type=int, default=2, help="Number of trials to run")
     parser.add_argument("--num_workers", type=int, default=32, help="Number of worker processes for multiprocessing")
     parser.add_argument("--multiprocessing", action="store_true", help="Enable multiprocessing")
@@ -608,9 +608,9 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     
     # Load fitted parameters from parameter estimation files
-    control_params_df = pd.read_csv("analyses/synthetic_simulations/parameter_estimation/control_fitted_params.csv", index_col=0)
-    perturbed_params_df = pd.read_csv("analyses/synthetic_simulations/parameter_estimation/perturbed_fitted_params.csv", index_col=0)
-    all_params_df = pd.read_csv("analyses/synthetic_simulations/parameter_estimation/all_fitted_params.csv", index_col=0)
+    control_params_df = pd.read_csv("results/synthetic_simulations/parameter_estimation/control_fitted_params.csv", index_col=0)
+    perturbed_params_df = pd.read_csv("results/synthetic_simulations/parameter_estimation/perturbed_fitted_params.csv", index_col=0)
+    all_params_df = pd.read_csv("results/synthetic_simulations/parameter_estimation/all_fitted_params.csv", index_col=0)
     
     print("Using theta estimates from all cells combined")
     
