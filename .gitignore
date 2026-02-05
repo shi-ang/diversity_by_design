@@ -15,3 +15,6 @@ data/scGPT_human/
 data/save
 *.pt
 .vscode/
+
+logs/*
+run.sh

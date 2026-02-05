@@ -7,7 +7,12 @@ from datetime import datetime
 import multiprocessing
 from tqdm import tqdm
 from scipy import stats
+
+from .util import systematic_variation, intra_data_correlation
+from metrics.perturbation_effect.pearson import pearson_pert
 from metrics.perturbation_effect.perturbation_discrimination_score import compute_pds
+from metrics.perturbation_effect.r_square import r2_score_pert
+from metrics.reconstruction.mean_error import mean_error_pert
 
 # No scanpy or anndata imports needed if we are truly removing them
 
@@ -26,6 +31,7 @@ _PARAM_RANGES = {
     'mu_l': {'type': 'log_float', 'min': 0.2, 'max': 5.0} # 0.2, 5.0, mu_l
 }
 
+_MODELS = ["Control", "Average"]
 
 def nb_cells(mean, l_c, theta, rng): # theta kept as generic parameter name for this utility function
     """
@@ -58,7 +64,8 @@ def nb_cells(mean, l_c, theta, rng): # theta kept as generic parameter name for 
     predicted_counts = rng.negative_binomial(theta_arr, p)
     return predicted_counts
 
-def simulate_one_run_numpy( # Renamed to signify it's the numpy-only version
+
+def synthetic_DGP(
     G=10_000,   # number of genes
     N0=3_000,   # number of control cells
     Nk=150,     # number of perturbed cells per perturbation
@@ -71,16 +78,17 @@ def simulate_one_run_numpy( # Renamed to signify it's the numpy-only version
     control_mu=None, # Control mu parameters, size of total number of genes in the real dataset (>= G)
     pert_mu=None, # Perturbed mu parameters, size of total number of genes in the real dataset (>= G)
     trial_id_for_rng=None, # Optional for seeding RNG per trial,
-    model="Average", # The prediction model to use
 ):
     """
-    Simulate an experiment using only NumPy/Pandas for calculations.
+    Generate synthetic data parameters for the simulation.
+    Returns control_mu, pert_mu, all_theta
+    Each of shape (G,)
     """
     # Setup random number generator for this trial
     if trial_id_for_rng is not None:
         rng = np.random.RandomState(trial_id_for_rng)
     else:
-        rng = np.random.RandomState(42) # Fallback, but ideally seeded per trial
+        rng = np.random.RandomState(42)
     
     # --- Parameter Preparation with assertions ---
     # Assert that control_mu, pert_mu, and all_theta are provided
@@ -133,11 +141,150 @@ def simulate_one_run_numpy( # Renamed to signify it's the numpy-only version
         lib_size_pert = rng.lognormal(mean=mu_l, sigma=0.1714, size=Nk) # 0.1714 from all cells of the Norman19 dataset
         x_mat[current_row : current_row + Nk, :] = nb_cells(mean=mu_k_loop, l_c=lib_size_pert, theta=local_all_theta, rng=rng)
         current_row += Nk
-    # clean up the loop variables to free memory
-    del mu_k_loop
-    del lib_size_pert
-    del affected_mask_loop
     
+    return x_mat, all_affected_masks
+
+
+def evaluation(
+        x_pred,
+        x_obs,
+        mu_pred,
+        mu_obs,
+        mu_control_obs,
+        mu_pool_obs,
+        DEGs_list,
+        all_affected_masks,
+        model: str = "Average",
+):
+    """
+    Perform evaluation of the predicted single-cell profiles.
+    
+    :param x_pred: predicted single-cell profiles matrix, shape (n_cells, n_genes)
+    :param x_obs: observed single-cell profiles matrix, shape (n_cells, n_genes)
+    :param mu_pred: predicted mean expression matrix, shape (n_perturbations, n_genes)
+    :param mu_obs: observed mean expression matrix, shape (n_perturbations, n_genes)
+    :param mu_control_obs: observed mean expression matrix for control, shape (n_perturbations, n_genes)
+    :param mu_pool_obs: observed mean expression matrix for pooled data, shape (n_perturbations, n_genes)
+    :param DEGs_list: list of differentially expressed genes masks for each perturbation
+    :param all_affected_masks: list of masks indicating affected genes for each perturbation
+    :param model: The prediction model used, affects certain calculations
+    """
+    n_genes = mu_obs.shape[1]
+    n_perts = mu_obs.shape[0]
+    # PDS(Perturbation Discrimination Score) calculation
+    # PDS-l1 and PDS-l2 are independent of reference, because reference will be cancelled out
+    # TODO: check if the scores are the same 
+    pds_l1_score = compute_pds(
+        true_effects=mu_obs, # equally, mu_obs - hat_mu0
+        pred_effects=mu_pred, # equally, mu_pred - hat_mu0
+        metric="l1",
+    )
+
+    pds_l2_score = compute_pds(
+        true_effects=mu_obs,
+        pred_effects=mu_pred,
+        metric="l2",
+    )
+
+    # PSD-cosine uses reference, so we use mu_control as reference
+    # TODO: this should not be the same, check it
+    pds_cosine_score = compute_pds(
+        true_effects=mu_obs - mu_control_obs,
+        pred_effects=mu_pred - mu_control_obs,
+        metric="cosine",
+    )
+
+    # get genes which were affected by ANY perturbation for fraction calculation
+    any_affected_calculate = np.zeros(n_genes, dtype=bool)
+    if all_affected_masks:
+        for mask_item in all_affected_masks:
+            any_affected_calculate = np.logical_or(any_affected_calculate, mask_item)
+    
+    results_tracker = {
+        'pearson_all': [],
+        'pearson_affected': [],
+        'pearson_degs': [],
+        'mae_all': [],
+        'mae_affected': [],
+        'mae_degs': [],
+        'mse_all': [],
+        'mse_affected': [],
+        'mse_degs': [],
+    }
+    # Calculate metrics per perturbation
+    # "_all" is for all genes
+    # "_affected" is for the genes that were truly affected in the simulation (like true DEGs)
+    # "_degs" is for the genes identified as DEGs by the t-test (statistical DEGs)
+    for ptb_idx in range(n_perts):
+        current_affected_mask = all_affected_masks[ptb_idx]
+        current_degs_mask = DEGs_list[ptb_idx]  # Get the DEGs mask for current perturbation
+        
+        mu_obs_ptb = mu_obs[ptb_idx].astype(np.float32)
+        mu_pred_ptb = mu_pred[ptb_idx].astype(np.float32)
+        if model != "Control":
+            results_tracker['pearson_all'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs))
+            results_tracker['pearson_affected'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs, DEGs=current_affected_mask))
+            results_tracker['pearson_degs'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs, DEGs=current_degs_mask))
+
+        results_tracker['mae_all'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="absolute"))
+        results_tracker['mse_all'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="squared"))
+        results_tracker['mae_affected'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="absolute", weights=current_affected_mask.astype(np.float32))) 
+        results_tracker['mse_affected'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="squared", weights=current_affected_mask.astype(np.float32)))
+        results_tracker['mae_degs'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="absolute", weights=current_degs_mask.astype(np.float32)))
+        results_tracker['mse_degs'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="squared", weights=current_degs_mask.astype(np.float32)))
+
+    results_final = {
+        'pearson_all_median': np.nanmedian(results_tracker['pearson_all']) if results_tracker['pearson_all'] else np.nan,
+        'pearson_affected_median': np.nanmedian(results_tracker['pearson_affected']) if results_tracker['pearson_affected'] else np.nan,
+        'pearson_degs_median': np.nanmedian(results_tracker['pearson_degs']) if results_tracker['pearson_degs'] else np.nan,
+        'mae_all_median': np.nanmedian(results_tracker['mae_all']) if results_tracker['mae_all'] else np.nan,
+        'mae_affected_median': np.nanmedian(results_tracker['mae_affected']) if results_tracker['mae_affected'] else np.nan,
+        'mae_degs_median': np.nanmedian(results_tracker['mae_degs']) if results_tracker['mae_degs'] else np.nan,
+        'mse_all_median': np.nanmedian(results_tracker['mse_all']) if results_tracker['mse_all'] else np.nan,
+        'mse_affected_median': np.nanmedian(results_tracker['mse_affected']) if results_tracker['mse_affected'] else np.nan,
+        'mse_degs_median': np.nanmedian(results_tracker['mse_degs']) if results_tracker['mse_degs'] else np.nan,
+        'pds_l1': pds_l1_score,
+        'pds_l2': pds_l2_score,
+        'pds_cosine': pds_cosine_score,
+        'fraction_genes_affected': any_affected_calculate.mean() if n_genes > 0 and hasattr(any_affected_calculate, 'size') and any_affected_calculate.size == n_genes and any_affected_calculate.dtype == bool else np.nan,
+    }
+    return results_final
+
+
+def simulate_one_run_numpy( # Renamed to signify it's the numpy-only version
+    G=10_000,   # number of genes
+    N0=3_000,   # number of control cells
+    Nk=150,     # number of perturbed cells per perturbation
+    P=50,       # number of perturbations
+    p_effect=0.01,  # a threshold for fraction of genes affected per perturbation
+    effect_factor=2.0,  # effect factor for affected genes, epsilon in the paper
+    B=0.0,      # global perturbation bias factor, beta in the paper
+    mu_l=1.0,   # mean of log library size
+    all_theta=None, # Theta parameter for all cells , size of total number of genes in the real dataset (>= G)
+    control_mu=None, # Control mu parameters, size of total number of genes in the real dataset (>= G)
+    pert_mu=None, # Perturbed mu parameters, size of total number of genes in the real dataset (>= G)
+    trial_id_for_rng=None, # Optional for seeding RNG per trial,
+    model="Average", # The prediction model to use
+    normalize=True, # Whether to normalize the data
+):
+    """
+    Simulate an experiment using only NumPy/Pandas for calculations.
+    """
+    x_mat, all_affected_masks = synthetic_DGP(
+        G=G,
+        N0=N0,
+        Nk=Nk,
+        P=P,
+        p_effect=p_effect,
+        effect_factor=effect_factor,
+        B=B,
+        mu_l=mu_l,
+        all_theta=all_theta,
+        control_mu=control_mu,
+        pert_mu=pert_mu,
+        trial_id_for_rng=trial_id_for_rng,
+    )
+
     # --- Calculate some statistics for the synthetic data ---
     # overall sparsity
     sparsity = np.mean(x_mat <= 1e-8)
@@ -146,59 +293,50 @@ def simulate_one_run_numpy( # Renamed to signify it's the numpy-only version
     library_sizes = x_mat.sum(axis=1)
     # Avoid division by zero for cells with no counts
     library_sizes[library_sizes == 0] = 1 
+    avg_library_size = np.mean(library_sizes)
     
-    # Ensure library_sizes is a column vector for broadcasting
-    norm_factor = 1e4 / library_sizes[:, np.newaxis]
-    norm_mat = x_mat * norm_factor
-    norm_mat = norm_mat.astype(np.float32) # Cast to float32 after normalization
+    if normalize:
+        # Ensure library_sizes is a column vector for broadcasting
+        norm_factor = 1e4 / library_sizes[:, np.newaxis]
+        x_mat = x_mat.astype(np.float32)
+        x_mat = x_mat * norm_factor
+        del norm_factor
     del library_sizes
-    del norm_factor
-    # x_mat (raw counts) can be deleted if not needed directly later, 
-    # but it's good to keep if comparison to raw is ever needed.
-    # For this specific metric calculation, we proceed with norm_mat.
-    # Let's keep x_mat for now, and delete it at the very end if it's large.
 
-    # --- Manual Log1p Transformation ---
-    log_norm_mat = np.log1p(norm_mat)
-    del norm_mat # norm_mat is now transformed into log_norm_mat
+    # --- Log1p Transformation ---
+    log_x_mat = np.log1p(x_mat)
+    del x_mat
 
     # --- Metric Calculation on log_norm_mat ---
     # Compute both observed mean and variance of control cells, control block is [0:N0]
-    hat_mu0 = log_norm_mat[:N0, :].mean(axis=0)
-    hat_var0 = log_norm_mat[:N0, :].var(axis=0)
+    mu_control = log_x_mat[:N0, :].mean(axis=0)
+    var_control = log_x_mat[:N0, :].var(axis=0)
 
     # Compute mean and var for the pooled cells (all non-control cells), pooled block is [N0:]
-    hat_mu_pool = log_norm_mat[N0:, :].mean(axis=0)
+    mu_pool = log_x_mat[N0:, :].mean(axis=0)
 
-    # Compute delta_pred for pooled cells, this is constant across perturbations
-    # this will be used as the average baseline prediction
-    if model == "Average":
-        avg_delta_pred = hat_mu_pool - hat_mu0
-        delta_pred = np.tile(avg_delta_pred, (P, 1))
-    else:
-        raise NotImplementedError(f"Model '{model}' is not implemented.")
-
-    delta_obs = np.empty((P, G), dtype=np.float32)
+    mu_obs = np.empty((P, G), dtype=np.float32)
     degs_list = []
 
-    # for each perturbation, compute observed delta (true perturbation effect)
+    # for each perturbation, compute mean and variance of expression
     # and compute p-values for all genes, and determine DEGs based on that
     for p_idx in range(P):
         start = N0 + p_idx * Nk
         end = start + Nk
         
         # Compute mean, var and delta for the current perturbation
-        hat_muk = log_norm_mat[start:end, :].mean(axis=0)
-        hat_vark = log_norm_mat[start:end, :].var(axis=0)
-        delta_obs[p_idx, :] = hat_muk - hat_mu0
+        mu_pertk = log_x_mat[start:end, :].mean(axis=0)
+        var_pertk = log_x_mat[start:end, :].var(axis=0)
+        # delta_obs[p_idx, :] = hat_muk - hat_mu0
+        mu_obs[p_idx, :] = mu_pertk
 
         # a vector of p-values for all genes, for this perturbation
         _, pvals = stats.ttest_ind_from_stats(
-                    mean1=hat_muk,
-                    std1=np.sqrt(hat_vark),
+                    mean1=mu_pertk,
+                    std1=np.sqrt(var_pertk),
                     nobs1=Nk,
-                    mean2=hat_mu0,
-                    std2=np.sqrt(hat_var0),
+                    mean2=mu_control,
+                    std2=np.sqrt(var_control),
                     nobs2=Nk, # NOTE: Left like this for the over estimation of variance
                     equal_var=False,  # Welch's, going conservative due to large size differences
                 )
@@ -217,136 +355,58 @@ def simulate_one_run_numpy( # Renamed to signify it's the numpy-only version
         deg_mask[top_deg_indices] = True
         degs_list.append(deg_mask)
         
-        del hat_muk
-        del hat_vark
+    del mu_pertk, var_pertk
 
-    # --- Compute evaluation metrics (similar to original but on NumPy arrays) ---
-
-    # pds calculation
-    pds_l1_score = compute_pds(
-        true_effects=delta_obs,
-        pred_effects=delta_pred,
-        metric="l1",
+    sys_var = systematic_variation(
+        ptb_shifts=mu_obs,
+        avg_ptb_shift=mu_pool - mu_control,
     )
+    intra_corr = intra_data_correlation(data=log_x_mat)
 
-    pds_l2_score = compute_pds(
-        true_effects=delta_obs,
-        pred_effects=delta_pred,
-        metric="l2",
-    )
-
-    pds_cosine_score = compute_pds(
-        true_effects=delta_obs,
-        pred_effects=delta_pred,
-        metric="cosine",
-    )
-
-    # "_all" is for all genes
-    # "_affected" is for the genes that were truly affected in the simulation (like true DEGs)
-    # "_degs" is for the genes identified as DEGs by the t-test (statistical DEGs)
-    results_accumulator = {
-        'pearson_all': [], 'pearson_affected': [],
-        'mae_all': [], 'mae_affected': [],
-        'mse_all': [], 'mse_affected': [],
-        'pearson_degs': [], 'mae_degs': [], 'mse_degs': [],  # Added metrics for DEGs
-    }
-
-    # get genes which were affected by ANY perturbation for fraction calculation
-    any_affected_calculate = np.zeros(G, dtype=bool)
-    if all_affected_masks:
-        for mask_item in all_affected_masks:
-            any_affected_calculate = np.logical_or(any_affected_calculate, mask_item)
-    
-    # Calculate metrics per perturbation
-    for ptb_idx in range(P):
-        current_affected_mask = all_affected_masks[ptb_idx]
-        current_degs_mask = degs_list[ptb_idx]  # Get the DEGs mask for current perturbation
-        
-        delta_obs_ptb = delta_obs[ptb_idx].astype(np.float32)
-        delta_pred_ptb = delta_pred[ptb_idx].astype(np.float32)
-
-        if np.std(delta_obs_ptb) > 1e-6 and np.std(delta_pred_ptb) > 1e-6:
-            corr_all = np.corrcoef(delta_obs_ptb, delta_pred_ptb)[0, 1]
-        else:
-            corr_all = np.nan
-        results_accumulator['pearson_all'].append(corr_all)
-        
-        if current_affected_mask.sum() > 1:
-            # Slice arrays first, then check std
-            delta_obs_affected = delta_obs_ptb[current_affected_mask]
-            delta_pred_affected = delta_pred_ptb[current_affected_mask]
-            if np.std(delta_obs_affected) > 1e-6 and np.std(delta_pred_affected) > 1e-6:
-                corr_affected = np.corrcoef(delta_obs_affected, delta_pred_affected)[0, 1]
-            else:
-                corr_affected = np.nan
-            results_accumulator['pearson_affected'].append(corr_affected)
-            del delta_obs_affected
-            del delta_pred_affected
-        else:
-            results_accumulator['pearson_affected'].append(np.nan)
-        
-        results_accumulator['mae_all'].append(np.mean(np.abs(delta_obs_ptb - delta_pred_ptb)))
-        results_accumulator['mse_all'].append(np.mean(np.square(delta_obs_ptb - delta_pred_ptb)))
-        
-        if current_affected_mask.sum() > 0:
-            results_accumulator['mae_affected'].append(np.mean(np.abs(delta_obs_ptb[current_affected_mask] - delta_pred_ptb[current_affected_mask])))
-            results_accumulator['mse_affected'].append(np.mean(np.square(delta_obs_ptb[current_affected_mask] - delta_pred_ptb[current_affected_mask])))
-        else:
-            results_accumulator['mae_affected'].append(np.nan)
-            results_accumulator['mse_affected'].append(np.nan)
-        
-        # Calculate metrics for DEGs in the same way as for affected genes
-        if current_degs_mask.sum() > 1:
-            # Slice arrays first, then check std
-            delta_obs_degs = delta_obs_ptb[current_degs_mask]
-            delta_pred_degs = delta_pred_ptb[current_degs_mask]
-            if np.std(delta_obs_degs) > 1e-6 and np.std(delta_pred_degs) > 1e-6:
-                corr_degs = np.corrcoef(delta_obs_degs, delta_pred_degs)[0, 1]
-            else:
-                corr_degs = np.nan
-            results_accumulator['pearson_degs'].append(corr_degs)
-            del delta_obs_degs
-            del delta_pred_degs
-        else:
-            results_accumulator['pearson_degs'].append(np.nan)
-        
-        if current_degs_mask.sum() > 0:
-            results_accumulator['mae_degs'].append(np.mean(np.abs(delta_obs_ptb[current_degs_mask] - delta_pred_ptb[current_degs_mask])))
-            results_accumulator['mse_degs'].append(np.mean(np.square(delta_obs_ptb[current_degs_mask] - delta_pred_ptb[current_degs_mask])))
-        else:
-            results_accumulator['mae_degs'].append(np.nan)
-            results_accumulator['mse_degs'].append(np.nan)
-        # del current_affected_mask # Mask is from all_affected_masks, will be deleted later
-
-    # Clean up large arrays
-    del local_control_mu
-    del local_all_theta  # Theta parameter from all cells estimation
-    del x_mat # Raw counts matrix
-    del log_norm_mat # Final processed matrix for metrics
-    del all_affected_masks
-    del hat_mu0
-    del delta_pred
-    # any_affected_calculate is deleted after final_metrics_to_return in some versions, ensure it's covered.
-
-    final_metrics_to_return = {
-        'pearson_all_median': np.nanmedian(results_accumulator['pearson_all']) if results_accumulator['pearson_all'] else np.nan,
-        'pearson_affected_median': np.nanmedian(results_accumulator['pearson_affected']) if results_accumulator['pearson_affected'] else np.nan,
-        'pearson_degs_median': np.nanmedian(results_accumulator['pearson_degs']) if results_accumulator['pearson_degs'] else np.nan,
-        'mae_all_median': np.nanmedian(results_accumulator['mae_all']) if results_accumulator['mae_all'] else np.nan,
-        'mae_affected_median': np.nanmedian(results_accumulator['mae_affected']) if results_accumulator['mae_affected'] else np.nan,
-        'mae_degs_median': np.nanmedian(results_accumulator['mae_degs']) if results_accumulator['mae_degs'] else np.nan,
-        'mse_all_median': np.nanmedian(results_accumulator['mse_all']) if results_accumulator['mse_all'] else np.nan,
-        'mse_affected_median': np.nanmedian(results_accumulator['mse_affected']) if results_accumulator['mse_affected'] else np.nan,
-        'mse_degs_median': np.nanmedian(results_accumulator['mse_degs']) if results_accumulator['mse_degs'] else np.nan,
-        'pds_l1': pds_l1_score,
-        'pds_l2': pds_l2_score,
-        'pds_cosine': pds_cosine_score,
-        'fraction_genes_affected': any_affected_calculate.mean() if G > 0 and hasattr(any_affected_calculate, 'size') and any_affected_calculate.size == G and any_affected_calculate.dtype == bool else np.nan,
+    data_stats = {
         'sparsity': sparsity,
+        'average_library_size': avg_library_size,
+        'systematic_variation': sys_var,
+        'intra_data_correlation': intra_corr,
     }
-    del results_accumulator
-    del any_affected_calculate # Ensure this is deleted
-    return final_metrics_to_return
+    del sparsity, avg_library_size, sys_var, intra_corr
+
+
+    all_results = []
+    for model in _MODELS:
+        start_time = time.time()
+        # --- Fit the prediction model ---
+        if model == "Control":
+            x_pred = None
+            mu_pred = np.tile(mu_control, (P, 1))
+        elif model == "Average":
+            x_pred = None
+            mu_pred = np.tile(mu_pool, (P, 1))
+        else:
+            raise NotImplementedError(f"Model '{model}' is not implemented.")
+
+        # evaluation
+        model_results = evaluation(
+            x_pred=x_pred,
+            x_obs=log_x_mat,
+            mu_obs=mu_obs,
+            mu_pred=mu_pred,
+            mu_control_obs=mu_control,
+            mu_pool_obs=mu_pool,
+            DEGs_list=degs_list,
+            all_affected_masks=all_affected_masks,
+        )
+        model_results.update({
+            'model': model,
+            'execution_time': time.time() - start_time,
+            **data_stats
+        })
+
+        # add to result dataframe
+        all_results.append(model_results)
+    
+    return all_results
+
 
 def sample_parameters(param_ranges): # Unchanged from original
     params = {}
@@ -388,41 +448,44 @@ def _pool_worker_timed(task_info_dict):
     params_for_sim['all_theta'] = all_theta_from_main
     params_for_sim['pert_mu'] = pert_mu_from_main
     
-    start_time = time.time()
     try:
         # Ensure all required keys by simulate_one_run_numpy are in params_for_sim
         # G, N0, Nk, P, p_effect, effect_factor are expected from sample_parameters
-        metrics = simulate_one_run_numpy(**params_for_sim)
-        execution_time = time.time() - start_time
+        results_per_sim = simulate_one_run_numpy(**params_for_sim)
         
         # Prepare results: original sampled params + metrics + supporting info
         # `params_dict` is the original sampled params.
-        final_result = {**params_dict, **metrics, 
-                        'execution_time': execution_time, 
-                        'trial_id': trial_id, 'status': 'success'}
-        return final_result
+        final_results_per_sim = []
+        for results_per_sim_model in results_per_sim:
+            final_results_per_sim.append({
+                **params_dict, 
+                **results_per_sim_model, 
+                'trial_id': trial_id, 
+                'status': 'success'}
+            )
+        return final_results_per_sim
         
     except Exception as e:
-        execution_time = time.time() - start_time
         # Define metrics_error_keys locally for safety
         metrics_error_keys_local = { 
-            'pearson_all_median', 'pearson_affected_median',
-            'mae_all_median', 'mae_affected_median',
-            'mse_all_median', 'mse_affected_median',
+            'pearson_all_median', 'pearson_affected_median', 'pearson_degs_median',
+            'mae_all_median', 'mae_affected_median', 'mae_degs_median',
+            'mse_all_median', 'mse_affected_median', 'mse_degs_median',
             'pds_l1', 'pds_l2', 'pds_cosine',
-            'fraction_genes_affected', 'sparsity'
+            'fraction_genes_affected', 
+            'model', 'execution_time',
+            'sparsity', 'average_library_size', 'systematic_variation', 'intra_sample_correlation',
         }
         metrics_error = {key: np.nan for key in metrics_error_keys_local}
 
         final_result_error = {
             **params_dict, # original sampled params
             **metrics_error,
-            'execution_time': execution_time,
             'trial_id': trial_id,
             'status': 'failed',
             'error': str(e)
         }
-        return final_result_error
+        return [final_result_error] * len(_MODELS)
 
 
 def est_cost(params):
@@ -479,7 +542,7 @@ def run_random_sweep_final(
             print("\nProcessing trials (NumPy version with worker timing):")
             with tqdm(total=n_trials, desc="Running Trials (NumPy)") as pbar:
                 for result_from_worker in pool.imap_unordered(_pool_worker_timed, tasks_for_pool):
-                    all_results_data.append(result_from_worker)
+                    all_results_data += result_from_worker
                     pbar.update(1)
     else:
         init_worker(control_mu, all_theta, pert_mu)
@@ -487,12 +550,12 @@ def run_random_sweep_final(
         with tqdm(total=n_trials, desc="Running Trials (NumPy)") as pbar:
             for task in tasks_for_pool:
                 result_from_worker = _pool_worker_timed(task)
-                all_results_data.append(result_from_worker)
+                all_results_data += result_from_worker
                 pbar.update(1)
 
     results_df = pd.DataFrame(all_results_data)
     
-    success_count = results_df[results_df['status'] == 'success'].shape[0] if 'status' in results_df else 0
+    success_count = results_df[(results_df['status'] == 'success') & (results_df["model"] == "Average")].shape[0] if 'status' in results_df else 0
     failure_count = n_trials - success_count
 
     if failure_count > 0 and 'status' in results_df: # Ensure 'status' column exists
