@@ -395,6 +395,7 @@ def simulate_one_run_numpy( # Renamed to signify it's the numpy-only version
             mu_pool_obs=mu_pool,
             DEGs_list=degs_list,
             all_affected_masks=all_affected_masks,
+            model=model,
         )
         model_results.update({
             'model': model,
