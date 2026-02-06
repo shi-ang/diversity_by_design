@@ -144,7 +144,7 @@ def evaluation(
     return results_final
 
 
-def simulate_one_run_numpy(
+def simulate_one_run(
     G=10_000,   # number of genes
     N0=3_000,   # number of control cells
     Nk=150,     # number of perturbed cells per perturbation
@@ -440,7 +440,7 @@ def _pool_worker_timed(task_info_dict):
     try:
         # Ensure all required keys by simulate_one_run_numpy are in params_for_sim
         # G, N0, Nk, P, p_effect, effect_factor are expected from sample_parameters
-        results_per_sim = simulate_one_run_numpy(**params_for_sim)
+        results_per_sim = simulate_one_run(**params_for_sim)
         
         # Prepare results: original sampled params + metrics + supporting info
         # `params_dict` is the original sampled params.
